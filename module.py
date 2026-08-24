@@ -3,6 +3,10 @@ Persistent Priority Queue backed by an Indexed Min-Max Heap.
 
 Implements a double-ended priority queue with O(1) ID lookups and crash-resilient
 JSON persistence via atomic writes (write-tmp -> fsync -> atomic replace).
+
+The underlying in-memory heap operations run in O(log n) time or better.
+Each mutating operation additionally incurs O(n) persistence overhead because
+the complete queue state is serialized to JSON.
 """
 
 from __future__ import annotations
@@ -76,7 +80,7 @@ def _validate_value(value: Any) -> None:
 class PersistentPriorityQueue:
     """A double-ended persistent priority queue backed by an Indexed Min-Max Heap.
 
-    In-Memory Complexity:
+    The underlying in-memory heap operations run in O(log n) time or better:
       - insert:      O(log n)
       - extract_min: O(log n)
       - extract_max: O(log n)
@@ -85,8 +89,8 @@ class PersistentPriorityQueue:
       - delete:      O(log n)
       - is_empty:    O(1)
 
-    Persistence Overhead:
-      Each mutating operation serializes queue state to JSON in O(n) time.
+    Each mutating operation additionally incurs O(n) persistence overhead because
+    the complete queue state is serialized to JSON.
     """
 
     def __init__(self, storage_path: str = "data/queue.json") -> None:

@@ -56,7 +56,7 @@ The persisted JSON stores the queue's logical elements (`item_id`, `priority`, `
 
 ## 4. Complexity Analysis
 
-It is important to distinguish the in-memory data structure complexity from the file serialization overhead.
+The underlying in-memory heap operations run in $O(\log n)$ time or better. Each mutating operation additionally incurs $O(n)$ persistence overhead because the complete queue state is serialized to JSON.
 
 ### In-Memory Complexity
 | Operation | Time Complexity | Space Complexity |
