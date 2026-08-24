@@ -1,122 +1,143 @@
 # Persistent Priority Queue
 
-A robust, production-grade **Double-Ended Persistent Priority Queue** implemented in pure Python (zero external dependencies). Backed by an **Indexed Min-Max Heap** (Atkinson et al., 1986), this data structure supports $O(\log n)$ dual min/max extractions, arbitrary item updates, and deletions, while persisting state atomically to disk.
+A persistent double-ended priority queue implementation in Python (Standard Library only), backed by an **Indexed Min-Max Heap** (Atkinson et al., 1986) and file-based JSON persistence.
 
 ---
 
-## 🚀 Key Features
+## 1. Problem Overview
 
-- **Double-Ended Priority Queue**: Efficiently access and extract both highest-priority (minimum value) and lowest-priority (maximum value) elements in $O(\log n)$ time.
-- **$O(1)$ Positional Lookups**: Internal dictionary index mapping `item_id → heap_index` enables $O(\log n)$ updates and deletions of arbitrary elements without linear scans.
-- **Strict FIFO Tie-Breaking**: Items with identical priority values retain strict FIFO (First-In, First-Out) ordering based on their initial insertion order. Priority updates preserve the original insertion order timestamp.
-- **Crash-Resilient Atomic Persistence**: Uses an atomic write strategy (`write-to-temp` $\to$ `fsync` $\to$ `os.replace`) to guarantee data integrity even during sudden crashes or power interruptions.
-- **Type-Safe Validation**: Strict runtime validation of input types and values (rejects `bool`, `NaN`, $\pm\infty$, duplicate IDs).
-
----
-
-## ⏱️ Complexity & Operations
-
-| Operation | Description | Time Complexity | Space Complexity |
-| :--- | :--- | :---: | :---: |
-| `insert(item_id, priority, value=None)` | Inserts a new item with unique ID and priority | $O(\log n)$ | $O(1)$ |
-| `extract_min()` | Removes and returns item with lowest priority value | $O(\log n)$ | $O(1)$ |
-| `extract_max()` | Removes and returns item with highest priority value | $O(\log n)$ | $O(1)$ |
-| `peek()` | Inspects lowest priority item without removing it | $O(1)$ | $O(1)$ |
-| `update(item_id, new_priority)` | Modifies priority of an existing item | $O(\log n)$ | $O(1)$ |
-| `delete(item_id)` | Removes an arbitrary item by its ID | $O(\log n)$ | $O(1)$ |
-| `is_empty()` | Checks if the priority queue contains 0 items | $O(1)$ | $O(1)$ |
+Standard priority queues typically support retrieving only the minimum (or maximum) element in $O(\log n)$ time. However, many real-world workloads require:
+1. Accessing both high-priority and low-priority items without rebuilding the heap.
+2. Updating or deleting arbitrary items in $O(\log n)$ time without linear $O(n)$ search overhead.
+3. Durable persistence to disk so that state survives application restarts and crashes.
+4. Deterministic FIFO ordering when priorities are equal.
 
 ---
 
-## 🛠️ Architecture & Implementation Details
+## 2. Design Choices & Architecture
 
-1. **Min-Max Heap Structure**:
-   - Alternating levels in the binary tree represent *min-levels* (even depth $0, 2, \dots$) and *max-levels* (odd depth $1, 3, \dots$).
-   - A node on a min-level is smaller than or equal to all descendants.
-   - A node on a max-level is greater than or equal to all descendants.
-   - The minimum element is always at root index `0`. The maximum element is always at index `1` or `2` (the children of the root).
+### Why Indexed Min-Max Heap?
+A **Min-Max Heap** is a complete binary tree that alternates between *min-levels* (even depths: 0, 2, 4...) and *max-levels* (odd depths: 1, 3, 5...):
+- Every node on a min-level is smaller than or equal to all its descendants.
+- Every node on a max-level is larger than or equal to all its descendants.
+- **Root (index 0)** holds the global minimum ($O(1)$ peek, $O(\log n)$ extraction).
+- **Root's children (indices 1 & 2)** hold the global maximum ($O(\log n)$ extraction).
 
-2. **Positional Indexing (`_index`)**:
-   - Maintains a bidirectional mapping `_index: dict[str, int]` kept in sync on every heap swap.
-   - Allows arbitrary element deletion and priority updates to jump directly to the heap node in $O(1)$ time, followed by $O(\log n)$ sift operations (`_push_up` / `_push_down`).
+This provides dual-ended capabilities in a single contiguous array without maintaining two separate heaps or complex pointer structures.
 
-3. **Atomic Persistence**:
-   - State is stored in standard JSON schema with schema versioning and sequential metadata.
-   - Prior to modifying the target file, data is written to a `.tmp` file, flushed to disk via `os.fsync()`, and replaced atomically using filesystem-level primitives (`os.replace`).
+### Role of the Index Map
+Standard heaps require $O(n)$ linear scans to find an arbitrary element before updating or deleting it. This implementation maintains an internal bidirectional hash map:
+$$\text{\_index}: \text{item\_id} \to \text{heap\_index}$$
+The index map is updated during every heap swap ($O(1)$). This enables:
+- Arbitrary priority updates in $O(\log n)$ time.
+- Arbitrary item deletions in $O(\log n)$ time.
+- Immediate duplicate ID rejection in $O(1)$ time.
 
----
-
-## 🌍 Real-World Use Cases
-
-Priority queues are fundamental building blocks in high-scale systems:
-
-1. **Workforce Management & Job Scheduling (e.g., SARALWEB)**:
-   - Dynamic dispatching of field technicians or shift workers where urgent attendance, compliance alerts, and emergency service requests must preempt standard background tasks.
-2. **Dijkstra’s Algorithm & A\* Pathfinding**:
-   - Route planning, logistics optimization, and network packet routing where vertices with minimal tentative distance are expanded first.
-3. **Operating System Process & Thread Schedulers**:
-   - Multilevel feedback queues where CPU burst priorities determine process execution order, with real-time tasks taking precedence over batch jobs.
-4. **Event-Driven Simulation & Timers**:
-   - Simulators (e.g., network packet simulators, financial order-book matching engines) scheduling future events ordered by timestamp.
-5. **Bandwidth Management & Quality of Service (QoS)**:
-   - Routers prioritizing latency-sensitive voice/video traffic (VoIP) over bulk file transfer packets.
+### Strict FIFO Tie-Breaking
+Each item is assigned a monotonic sequence number `seq` upon insertion. Heap comparisons use the key `(priority, seq)`.
+- When priorities are equal, items with smaller `seq` (inserted earlier) are dequeued first by `extract_min`.
+- When updating an item's priority via `update()`, its original `seq` is preserved.
 
 ---
 
-## 📦 Installation & Setup
+## 3. Persistence Strategy
 
-### Prerequisites
-- Python 3.8+ (Zero third-party runtime dependencies).
-- `pytest` (for running the test suite).
+### Atomic Writes
+State is persisted to a single JSON file on each mutating operation (`insert`, `update`, `delete`, `extract_min`, `extract_max`).
+To prevent file corruption during crashes or mid-write interruptions:
+1. The serialized payload is written to a temporary file (`<filename>.tmp`).
+2. `os.fsync()` flushes file buffers to physical storage.
+3. `os.replace()` atomically swaps the temporary file into the destination path.
 
-### Install dependencies
-```bash
-pip install -r requirements.txt
-```
+### Logical Representation & Reconstruction
+The persisted JSON stores the queue's logical elements (`item_id`, `priority`, `seq`, `value`) and `next_seq`. The in-memory heap order and hash index are derived structures rebuilt in $O(n)$ time on load using Floyd's bottom-up heap construction algorithm.
 
 ---
 
-## 💻 Usage Example
+## 4. Complexity Analysis
+
+It is important to distinguish the in-memory data structure complexity from the file serialization overhead.
+
+### In-Memory Complexity
+| Operation | Time Complexity | Space Complexity |
+| :--- | :---: | :---: |
+| `insert(item_id, priority, value=None)` | $O(\log n)$ | $O(1)$ |
+| `extract_min()` | $O(\log n)$ | $O(1)$ |
+| `extract_max()` | $O(\log n)$ | $O(1)$ |
+| `peek()` | $O(1)$ | $O(1)$ |
+| `update(item_id, new_priority)` | $O(\log n)$ | $O(1)$ |
+| `delete(item_id)` | $O(\log n)$ | $O(1)$ |
+| `is_empty()` | $O(1)$ | $O(1)$ |
+
+### Persistence Overhead
+Because the entire queue is serialized to JSON on each mutation to guarantee crash consistency, disk persistence adds an **$O(n)$** serialization and I/O cost per mutation.
+
+---
+
+## 5. API & Usage Examples
 
 ```python
 from module import PersistentPriorityQueue
 
-# Initialize queue with automatic persistence to 'data/queue.json'
+# Initialize or load existing queue from disk
 pq = PersistentPriorityQueue(storage_path="data/queue.json")
 
-# 1. Insert tasks (lower number = higher urgency)
-pq.insert("task-101", priority=5, value={"title": "Generate Monthly Report"})
-pq.insert("task-102", priority=1, value={"title": "Emergency Server Restart"})
-pq.insert("task-103", priority=8, value={"title": "Routine DB Backup"})
+# 1. Insert items (numeric priority, optional JSON-serializable value)
+pq.insert("job-101", priority=10, value={"task": "Generate report"})
+pq.insert("job-102", priority=1, value={"task": "Critical server patch"})
+pq.insert("job-103", priority=25, value={"task": "Nightly backup"})
 
-# 2. Peek at the most urgent task
+# 2. Inspect the highest urgency item without removing it
 print(pq.peek())
-# Output: {'item_id': 'task-102', 'priority': 1, 'value': {'title': 'Emergency Server Restart'}}
+# Output: {'item_id': 'job-102', 'priority': 1, 'value': {'task': 'Critical server patch'}}
 
-# 3. Extract highest priority (minimum value)
-urgent = pq.extract_min()
-print("Processed:", urgent["item_id"])  # task-102
+# 3. Extract minimum and maximum elements
+urgent_job = pq.extract_min()  # Returns job-102 (priority 1)
+batch_job = pq.extract_max()   # Returns job-103 (priority 25)
 
-# 4. Extract lowest priority (maximum value)
-batch_job = pq.extract_max()
-print("Deferred:", batch_job["item_id"])  # task-103
+# 4. Update priority of an existing item
+pq.update("job-101", new_priority=2)
 
-# 5. Update priority of an existing task
-pq.update("task-101", new_priority=2)
+# 5. Delete an arbitrary item
+deleted = pq.delete("job-101")
 
-# 6. Delete a specific task
-deleted = pq.delete("task-101")
-print("Deleted:", deleted["item_id"])
-
-# 7. Check if empty
-print("Is empty?", pq.is_empty())  # True
+# 6. Check status
+print("Is empty:", pq.is_empty())
 ```
 
 ---
 
-## 🧪 Running the Test Suite
+## 6. Real-World Use Cases
 
-The test suite includes 72 thorough unit tests, randomized differential oracle tests (30,000 operations), crash/restart stress tests, and invariant checks:
+1. **Workforce Management & Job Dispatch (e.g., SARALWEB)**:
+   - Scheduling field staff and worker assignments where critical emergency calls preempt scheduled shifts, while low-priority routine tasks are deferred when load is high.
+2. **Graph Routing & Pathfinding (Dijkstra / A\*)**:
+   - Expanding graph nodes with lowest estimated cost while updating path distances (`update()`) when shorter paths are discovered.
+3. **Operating System Scheduling**:
+   - Prioritizing real-time interactive tasks over background batch computation with deterministic tie-breaking.
+4. **Network Bandwidth & Quality of Service (QoS)**:
+   - Prioritizing latency-sensitive VoIP/video packets over bulk data downloads.
+
+---
+
+## 7. Assumptions & Input Constraints
+
+- **IDs**: Must be non-empty strings and unique within the queue.
+- **Priorities**: Must be finite `int` or `float` (`bool`, `NaN`, and $\pm\infty$ are rejected).
+- **Values**: Optional payload must be JSON-serializable. Value serializability is validated before modifying in-memory state.
+- **Dependencies**: Python standard library only for runtime. `pytest` is used for testing.
+
+---
+
+## 8. Setup & Testing
+
+### Installation
+```bash
+pip install -r requirements.txt
+```
+
+### Running Tests
+Run the test suite including unit tests, invariant checks, persistence reload across varying queue sizes, and randomized differential testing:
 
 ```bash
 python -m pytest -v

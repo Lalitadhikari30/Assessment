@@ -1,26 +1,8 @@
 """
-Persistent Priority Queue — Indexed Min-Max Heap Implementation.
+Persistent Priority Queue backed by an Indexed Min-Max Heap.
 
-A double-ended priority queue backed by a min-max heap (Atkinson, Sack,
-Santoro & Strothotte, 1986) with an ``item_id → heap-index`` map for O(1)
-positional lookup.  State is persisted to a JSON file using atomic writes.
-
-All seven required operations run in O(log n) time or better:
-
-    insert, extract_min, extract_max, peek, update, delete, is_empty
-
-Items are identified by unique string IDs.  Priorities are numeric (int or
-float — ``bool``, ``NaN``, and infinities are rejected).  Among items with
-equal priority, FIFO ordering is maintained based on original insertion
-order.
-
-Persistence format
-------------------
-A single JSON file stores the queue version, a monotonic sequence counter,
-and the list of items.  Writes follow a write-tmp → fsync → atomic-replace
-strategy so that a crash mid-write never corrupts the primary file.
-
-Zero external dependencies — uses only the Python standard library.
+Implements a double-ended priority queue with O(1) ID lookups and crash-resilient
+JSON persistence via atomic writes (write-tmp -> fsync -> atomic replace).
 """
 
 from __future__ import annotations
@@ -32,17 +14,8 @@ from pathlib import Path
 from typing import Any, Union
 
 
-# ---------------------------------------------------------------------------
-# Internal heap entry
-# ---------------------------------------------------------------------------
-
 class _HeapEntry:
-    """A single entry in the min-max heap.
-
-    Comparison key is ``(priority, seq)`` to ensure a strict total order.
-    Lower priority = higher urgency.  Among equal priorities, lower ``seq``
-    (earlier insertion) comes first.
-    """
+    """Entry stored in the heap with comparison key (priority, seq)."""
 
     __slots__ = ("priority", "seq", "item_id", "value")
 
@@ -59,11 +32,11 @@ class _HeapEntry:
         self.value = value
 
     def _key(self) -> tuple:
-        """Return the comparison key for heap ordering."""
+        """Return (priority, seq) tuple for strict deterministic ordering."""
         return (self.priority, self.seq)
 
     def to_dict(self) -> dict:
-        """Return a user-facing dictionary representation."""
+        """Return user-facing dictionary representation."""
         return {
             "item_id": self.item_id,
             "priority": self.priority,
@@ -77,67 +50,50 @@ class _HeapEntry:
         )
 
 
-# ---------------------------------------------------------------------------
-# Input validators
-# ---------------------------------------------------------------------------
-
 def _validate_priority(priority: Any) -> None:
-    """Raise ``TypeError`` / ``ValueError`` if *priority* is not a finite
-    ``int`` or ``float``.  Rejects ``bool``, ``NaN``, and ``±inf``.
-    """
-    if isinstance(priority, bool):
-        raise TypeError("Priority must be an int or float, not bool")
-    if not isinstance(priority, (int, float)):
+    """Validate that priority is a finite int or float."""
+    if isinstance(priority, bool) or not isinstance(priority, (int, float)):
         raise TypeError("Priority must be an int or float")
     if isinstance(priority, float) and (math.isnan(priority) or math.isinf(priority)):
         raise ValueError("Priority must be finite; NaN and infinity are not allowed")
 
 
 def _validate_item_id(item_id: Any) -> None:
-    """Raise ``TypeError`` if *item_id* is not a ``str``."""
+    """Validate that item_id is a string."""
     if not isinstance(item_id, str):
         raise TypeError("item_id must be a string")
 
 
-# ---------------------------------------------------------------------------
-# Public class
-# ---------------------------------------------------------------------------
+def _validate_value(value: Any) -> None:
+    """Ensure value is JSON-serializable before modifying in-memory queue state."""
+    if value is not None:
+        try:
+            json.dumps(value)
+        except (TypeError, ValueError) as exc:
+            raise TypeError(f"Value must be JSON-serializable: {exc}") from exc
+
 
 class PersistentPriorityQueue:
-    """A persistent double-ended priority queue backed by a min-max heap.
+    """A double-ended persistent priority queue backed by an Indexed Min-Max Heap.
 
-    Supports O(log n) insert, extract_min, extract_max, update, and delete.
-    Supports O(1) peek (minimum) and is_empty.
+    In-Memory Complexity:
+      - insert:      O(log n)
+      - extract_min: O(log n)
+      - extract_max: O(log n)
+      - peek:        O(1)
+      - update:      O(log n)
+      - delete:      O(log n)
+      - is_empty:    O(1)
 
-    State is persisted to a JSON file after every mutating operation using
-    atomic writes (write-to-temp → fsync → ``os.replace``).
-
-    Items are identified by unique **string** IDs.  Priorities are numeric
-    (``int`` or ``float``; ``bool``, ``NaN``, and infinities are rejected).
-    Among items with equal priority, FIFO ordering is maintained based on
-    the item's **original** insertion order — ``update()`` does not change
-    the tie-breaking position.
-
-    Parameters
-    ----------
-    storage_path : str
-        Path to the JSON persistence file.  Parent directories are created
-        automatically on the first write.  Defaults to ``"data/queue.json"``.
-
-    Raises
-    ------
-    ValueError
-        If the persistence file exists but is malformed, has an unsupported
-        schema version, contains invalid data types, or has duplicate item
-        IDs.  The constructor fails fast — corrupted state is never silently
-        recovered.
+    Persistence Overhead:
+      Each mutating operation serializes queue state to JSON in O(n) time.
     """
 
     def __init__(self, storage_path: str = "data/queue.json") -> None:
         self._storage_path: Path = Path(storage_path)
         self._heap: list[_HeapEntry] = []
-        self._index: dict[str, int] = {}  # item_id → position in _heap
-        self._next_seq: int = 0  # next insertion sequence number
+        self._index: dict[str, int] = {}
+        self._next_seq: int = 0
         self._load()
 
     # ------------------------------------------------------------------
@@ -150,26 +106,11 @@ class PersistentPriorityQueue:
         priority: Union[int, float],
         value: Any = None,
     ) -> None:
-        """Insert a new item into the queue.
-
-        Parameters
-        ----------
-        item_id : str
-            Unique identifier for the item.
-        priority : int | float
-            Numeric priority (lower = higher urgency).
-        value : Any, optional
-            Arbitrary JSON-serialisable payload.
-
-        Raises
-        ------
-        TypeError
-            If *item_id* is not ``str``, or *priority* is not ``int``/``float``.
-        ValueError
-            If *item_id* already exists, or *priority* is ``NaN``/infinite.
-        """
+        """Insert a new item into the queue."""
         _validate_item_id(item_id)
         _validate_priority(priority)
+        _validate_value(value)
+
         if item_id in self._index:
             raise ValueError(f"Item '{item_id}' already exists")
 
@@ -183,136 +124,50 @@ class PersistentPriorityQueue:
         self._save()
 
     def extract_min(self) -> dict:
-        """Remove and return the minimum-priority item.
-
-        Returns
-        -------
-        dict
-            ``{"item_id": str, "priority": int|float, "value": Any}``
-
-        Raises
-        ------
-        KeyError
-            If the queue is empty.
-        """
+        """Remove and return the minimum-priority (highest urgency) item."""
         if not self._heap:
             raise KeyError("Queue is empty")
         return self._remove_at(0)
 
     def extract_max(self) -> dict:
-        """Remove and return the maximum-priority item.
-
-        Returns
-        -------
-        dict
-            ``{"item_id": str, "priority": int|float, "value": Any}``
-
-        Raises
-        ------
-        KeyError
-            If the queue is empty.
-        """
+        """Remove and return the maximum-priority (lowest urgency) item."""
         if not self._heap:
             raise KeyError("Queue is empty")
         return self._remove_at(self._find_max_index())
 
     def peek(self) -> dict:
-        """Return the **minimum-priority** item without removing it.
-
-        This always returns the item with the lowest priority value (highest
-        urgency).  To inspect the maximum, use ``extract_max()``.
-
-        Returns
-        -------
-        dict
-            ``{"item_id": str, "priority": int|float, "value": Any}``
-
-        Raises
-        ------
-        KeyError
-            If the queue is empty.
-        """
+        """Return the minimum-priority item without removing it."""
         if not self._heap:
             raise KeyError("Queue is empty")
         return self._heap[0].to_dict()
 
     def update(self, item_id: str, new_priority: Union[int, float]) -> None:
-        """Update the priority of an existing item.
-
-        The item's original insertion sequence number is **preserved** so
-        that FIFO tie-breaking among equal priorities remains based on when
-        the item was first inserted.
-
-        Parameters
-        ----------
-        item_id : str
-            The ID of the item to update.
-        new_priority : int | float
-            The new priority value.
-
-        Raises
-        ------
-        TypeError
-            If *item_id* is not ``str``, or *new_priority* is not numeric.
-        ValueError
-            If *new_priority* is ``NaN`` or infinite.
-        KeyError
-            If *item_id* is not found in the queue.
-        """
+        """Update priority of an existing item, preserving original FIFO seq."""
         _validate_item_id(item_id)
         _validate_priority(new_priority)
+
         if item_id not in self._index:
             raise KeyError(f"Item '{item_id}' not found")
 
         pos = self._index[item_id]
         self._heap[pos].priority = new_priority
-        # Preserve original seq — do NOT assign a new sequence number.
-        #
-        # After updating the priority, the element may need to move up or
-        # down.  _push_up may swap it with an ancestor, leaving a
-        # displaced element at `pos`.  We must then push_down from `pos`
-        # to fix that displaced element's relationship with its children.
-        new_pos = self._push_up(pos)
-        if new_pos != pos:
-            # Element moved up — fix the displaced element at `pos`.
-            self._push_down(pos)
-        else:
-            # Element stayed — it might need to move down.
-            self._push_down(pos)
+
+        self._push_up(pos)
+        self._push_down(pos)
         self._save()
 
     def delete(self, item_id: str) -> dict:
-        """Remove a specific item by its ID.
-
-        Parameters
-        ----------
-        item_id : str
-            The ID of the item to delete.
-
-        Returns
-        -------
-        dict
-            ``{"item_id": str, "priority": int|float, "value": Any}``
-            of the removed item.
-
-        Raises
-        ------
-        TypeError
-            If *item_id* is not ``str``.
-        KeyError
-            If *item_id* is not found in the queue.
-        """
+        """Remove a specific item by its ID."""
         _validate_item_id(item_id)
         if item_id not in self._index:
             raise KeyError(f"Item '{item_id}' not found")
         return self._remove_at(self._index[item_id])
 
     def is_empty(self) -> bool:
-        """Return ``True`` if the queue contains no items."""
+        """Return True if the queue contains no items."""
         return len(self._heap) == 0
 
     def __len__(self) -> int:
-        """Return the number of items in the queue."""
         return len(self._heap)
 
     def __repr__(self) -> str:
@@ -326,95 +181,70 @@ class PersistentPriorityQueue:
     # ------------------------------------------------------------------
 
     def _remove_at(self, pos: int) -> dict:
-        """Remove the element at heap position *pos* and return it as a dict.
-
-        After removal, the heap property and index map are restored, and the
-        new state is persisted.
-        """
+        """Remove entry at position pos, restore heap order, and persist."""
         entry = self._heap[pos]
         result = entry.to_dict()
         last = len(self._heap) - 1
 
         if pos == last:
-            # Removing the last element — no heap fix needed.
             self._heap.pop()
             del self._index[entry.item_id]
         else:
-            # Move the last element into the vacated position.
             self._swap(pos, last)
             self._heap.pop()
             del self._index[entry.item_id]
-            # Restore heap order for the element now at *pos*.
-            # _push_up may move it upward; if so, fix *pos* afterward.
-            new_pos = self._push_up(pos)
-            if new_pos != pos:
-                self._push_down(pos)
-            else:
-                self._push_down(pos)
+            self._push_up(pos)
+            self._push_down(pos)
 
         self._save()
         return result
 
     def _find_max_index(self) -> int:
-        """Return the heap index of the maximum element.
-
-        In a min-max heap the maximum is the root when ``size == 1``, or
-        the larger of the root's two children (indices 1 and 2).
-        """
+        """Return index of maximum element (root if size 1, else larger child)."""
         n = len(self._heap)
         if n <= 1:
             return 0
         if n == 2:
             return 1
-        # The maximum lives among the root's children on max-level 1.
         return 1 if self._heap[1]._key() >= self._heap[2]._key() else 2
 
     # ------------------------------------------------------------------
-    # Internal: min-max heap operations
+    # Internal: Min-Max Heap algorithm (Atkinson et al., 1986)
     # ------------------------------------------------------------------
 
     @staticmethod
     def _is_min_level(i: int) -> bool:
-        """Return ``True`` if index *i* is on a min level (even depth).
-
-        Level = floor(log₂(i + 1)).  Using ``bit_length()`` avoids any
-        floating-point issues.
-        """
+        """Return True if index i is on a min-level (even depth 0, 2, ...)."""
         level = (i + 1).bit_length() - 1
         return level % 2 == 0
 
     def _swap(self, i: int, j: int) -> None:
-        """Swap two heap entries and update the index map atomically."""
+        """Swap heap elements and keep index map synchronized."""
         heap = self._heap
         idx = self._index
         idx[heap[i].item_id] = j
         idx[heap[j].item_id] = i
         heap[i], heap[j] = heap[j], heap[i]
 
-    # -- push up -------------------------------------------------------
-
     def _push_up(self, i: int) -> int:
-        """Push element at index *i* upward.  Returns its final position."""
+        """Push element at index i upward to its proper min/max level."""
         if i == 0:
             return 0
 
         parent = (i - 1) // 2
-
         if self._is_min_level(i):
-            # On a min level.
             if self._heap[i]._key() > self._heap[parent]._key():
                 self._swap(i, parent)
                 return self._push_up_max(parent)
             return self._push_up_min(i)
         else:
-            # On a max level.
             if self._heap[i]._key() < self._heap[parent]._key():
                 self._swap(i, parent)
                 return self._push_up_min(parent)
             return self._push_up_max(i)
 
     def _push_up_min(self, i: int) -> int:
-        """Bubble *i* upward through min (even) levels via grandparents."""
+        """Sift up through grandparent min-levels."""
         while i >= 3:
             grandparent = ((i - 1) // 2 - 1) // 2
             if self._heap[i]._key() < self._heap[grandparent]._key():
@@ -425,7 +255,7 @@ class PersistentPriorityQueue:
         return i
 
     def _push_up_max(self, i: int) -> int:
-        """Bubble *i* upward through max (odd) levels via grandparents."""
+        """Sift up through grandparent max-levels."""
         while i >= 3:
             grandparent = ((i - 1) // 2 - 1) // 2
             if self._heap[i]._key() > self._heap[grandparent]._key():
@@ -435,41 +265,36 @@ class PersistentPriorityQueue:
                 break
         return i
 
-    # -- push down -----------------------------------------------------
-
     def _push_down(self, i: int) -> None:
-        """Push element at index *i* downward to restore heap order."""
+        """Sift down from index i according to level type."""
         if self._is_min_level(i):
             self._push_down_min(i)
         else:
             self._push_down_max(i)
 
     def _push_down_min(self, i: int) -> None:
-        """Trickle-down on a min level (standard min-max heap algorithm)."""
+        """Sift down on a min-level by comparing with children and grandchildren."""
         while True:
             m, is_grandchild = self._smallest_descendant(i)
             if m is None:
-                return  # Leaf node.
+                return
 
             if is_grandchild:
                 if self._heap[m]._key() < self._heap[i]._key():
                     self._swap(m, i)
-                    # The element now at *m* may violate the max property
-                    # with its parent (which is on a max level).
                     parent_m = (m - 1) // 2
                     if self._heap[m]._key() > self._heap[parent_m]._key():
                         self._swap(m, parent_m)
-                    i = m  # Continue pushing down from grandchild position.
+                    i = m
                 else:
                     return
             else:
-                # *m* is a direct child — swap if needed and stop.
                 if self._heap[m]._key() < self._heap[i]._key():
                     self._swap(m, i)
                 return
 
     def _push_down_max(self, i: int) -> None:
-        """Trickle-down on a max level (symmetric to ``_push_down_min``)."""
+        """Sift down on a max-level by comparing with children and grandchildren."""
         while True:
             m, is_grandchild = self._largest_descendant(i)
             if m is None:
@@ -489,24 +314,18 @@ class PersistentPriorityQueue:
                     self._swap(m, i)
                 return
 
-    # -- descendant finders --------------------------------------------
-
-    def _smallest_descendant(self, i: int) -> tuple:
-        """Return ``(index, is_grandchild)`` of the smallest child or
-        grandchild, or ``(None, False)`` if *i* is a leaf.
-        """
+    def _smallest_descendant(self, i: int) -> tuple[int | None, bool]:
+        """Find smallest child/grandchild of node i."""
         n = len(self._heap)
         best = None
         best_key = None
         is_gc = False
 
-        # Children: indices 2i+1, 2i+2
         for c in range(2 * i + 1, min(2 * i + 3, n)):
             key = self._heap[c]._key()
             if best is None or key < best_key:
                 best, best_key, is_gc = c, key, False
 
-        # Grandchildren: indices 4i+3 .. 4i+6
         for gc in range(4 * i + 3, min(4 * i + 7, n)):
             key = self._heap[gc]._key()
             if best is None or key < best_key:
@@ -514,10 +333,8 @@ class PersistentPriorityQueue:
 
         return best, is_gc
 
-    def _largest_descendant(self, i: int) -> tuple:
-        """Return ``(index, is_grandchild)`` of the largest child or
-        grandchild, or ``(None, False)`` if *i* is a leaf.
-        """
+    def _largest_descendant(self, i: int) -> tuple[int | None, bool]:
+        """Find largest child/grandchild of node i."""
         n = len(self._heap)
         best = None
         best_key = None
@@ -534,35 +351,21 @@ class PersistentPriorityQueue:
                 best, best_key, is_gc = gc, key, True
 
         return best, is_gc
-
-    # -- heapify -------------------------------------------------------
 
     def _heapify(self) -> None:
-        """Build a valid min-max heap from ``self._heap`` in O(n) time.
-
-        Uses Floyd's bottom-up algorithm: call ``_push_down`` from the last
-        internal node down to the root.  Also rebuilds ``self._index``.
-        """
-        n = len(self._heap)
-        for i in range(n // 2 - 1, -1, -1):
+        """Rebuild min-max heap in O(n) Floyd bottom-up order."""
+        # Index map must exist before _push_down calls _swap
+        self._index = {entry.item_id: i for i, entry in enumerate(self._heap)}
+        for i in range(len(self._heap) // 2 - 1, -1, -1):
             self._push_down(i)
-        self._index = {
-            entry.item_id: pos for pos, entry in enumerate(self._heap)
-        }
 
     # ------------------------------------------------------------------
     # Internal: persistence
     # ------------------------------------------------------------------
 
     def _save(self) -> None:
-        """Persist the current queue state to disk.
-
-        Strategy: write to a temporary file, ``fsync``, then atomically
-        replace the original.  A crash before ``os.replace`` leaves the
-        previous valid file intact.
-        """
+        """Atomically persist queue state to disk."""
         self._storage_path.parent.mkdir(parents=True, exist_ok=True)
-
         data = {
             "version": 1,
             "next_seq": self._next_seq,
@@ -577,186 +380,104 @@ class PersistentPriorityQueue:
             ],
         }
 
-        tmp_path = self._storage_path.with_name(
-            self._storage_path.name + ".tmp"
-        )
-
-        with open(tmp_path, "w", encoding="utf-8") as fh:
-            json.dump(data, fh, ensure_ascii=False, indent=2)
-            fh.flush()
-            os.fsync(fh.fileno())
-
-        os.replace(tmp_path, self._storage_path)
+        tmp_path = self._storage_path.with_name(self._storage_path.name + ".tmp")
+        try:
+            with open(tmp_path, "w", encoding="utf-8") as fh:
+                json.dump(data, fh, ensure_ascii=False)
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(tmp_path, self._storage_path)
+        except Exception:
+            if tmp_path.exists():
+                try:
+                    tmp_path.unlink()
+                except OSError:
+                    pass
+            raise
 
     def _load(self) -> None:
-        """Load queue state from disk, or start with an empty queue.
-
-        Raises
-        ------
-        ValueError
-            If the file exists but is malformed, has an unsupported version,
-            contains invalid data types, or has duplicate item IDs.  No
-            automatic recovery is attempted — fail fast.
-        """
+        """Load queue state from disk or start empty if file does not exist."""
         if not self._storage_path.exists():
-            return  # Start with an empty queue.
+            return
 
-        # -- Parse JSON ------------------------------------------------
         try:
             with open(self._storage_path, "r", encoding="utf-8") as fh:
                 data = json.load(fh)
-        except json.JSONDecodeError as exc:
-            raise ValueError(
-                f"Corrupted persistence file '{self._storage_path}': "
-                f"invalid JSON"
-            ) from exc
+        except (json.JSONDecodeError, OSError) as exc:
+            raise ValueError(f"Corrupted persistence file: {exc}") from exc
 
-        # -- Validate root structure -----------------------------------
         if not isinstance(data, dict):
-            raise ValueError(
-                "Persistence file: root must be a JSON object"
-            )
+            raise ValueError("Persistence file root must be a JSON object")
         if data.get("version") != 1:
-            raise ValueError(
-                f"Persistence file: unsupported version "
-                f"{data.get('version')!r}"
-            )
+            raise ValueError(f"Unsupported schema version: {data.get('version')!r}")
 
         next_seq = data.get("next_seq")
-        if (
-            not isinstance(next_seq, int)
-            or isinstance(next_seq, bool)
-            or next_seq < 0
-        ):
-            raise ValueError(
-                "Persistence file: 'next_seq' must be a non-negative integer"
-            )
+        if not isinstance(next_seq, int) or isinstance(next_seq, bool) or next_seq < 0:
+            raise ValueError("Persistence file 'next_seq' must be a non-negative integer")
 
         items_raw = data.get("items")
         if not isinstance(items_raw, list):
-            raise ValueError("Persistence file: 'items' must be a list")
+            raise ValueError("Persistence file 'items' must be a list")
 
-        # -- Validate and build entries --------------------------------
-        seen_ids: set = set()
+        seen_ids: set[str] = set()
         entries: list[_HeapEntry] = []
 
         for idx, item in enumerate(items_raw):
             if not isinstance(item, dict):
-                raise ValueError(
-                    f"Persistence file: item at index {idx} must be a "
-                    f"JSON object"
-                )
+                raise ValueError(f"Item at index {idx} must be a JSON object")
 
             item_id = item.get("item_id")
             if not isinstance(item_id, str):
-                raise ValueError(
-                    f"Persistence file: item_id at index {idx} must be a "
-                    f"string, got {type(item_id).__name__}"
-                )
+                raise ValueError(f"item_id at index {idx} must be a string")
             if item_id in seen_ids:
-                raise ValueError(
-                    f"Persistence file: duplicate item_id '{item_id}'"
-                )
+                raise ValueError(f"Duplicate item_id '{item_id}' in persistence file")
             seen_ids.add(item_id)
 
             priority = item.get("priority")
-            if isinstance(priority, bool) or not isinstance(
-                priority, (int, float)
-            ):
-                raise ValueError(
-                    f"Persistence file: priority for '{item_id}' must be "
-                    f"int or float"
-                )
-            if isinstance(priority, float) and (
-                math.isnan(priority) or math.isinf(priority)
-            ):
-                raise ValueError(
-                    f"Persistence file: priority for '{item_id}' must be "
-                    f"finite"
-                )
+            if isinstance(priority, bool) or not isinstance(priority, (int, float)):
+                raise ValueError(f"Priority for '{item_id}' must be an int or float")
+            if isinstance(priority, float) and (math.isnan(priority) or math.isinf(priority)):
+                raise ValueError(f"Priority for '{item_id}' must be finite")
 
             seq = item.get("seq")
-            if not isinstance(seq, int) or isinstance(seq, bool):
+            if not isinstance(seq, int) or isinstance(seq, bool) or seq < 0 or seq >= next_seq:
                 raise ValueError(
-                    f"Persistence file: seq for '{item_id}' must be an "
-                    f"integer"
+                    f"seq for '{item_id}' must be an integer in range [0, {next_seq - 1}]"
                 )
 
-            entries.append(
-                _HeapEntry(priority, seq, item_id, item.get("value"))
-            )
+            entries.append(_HeapEntry(priority, seq, item_id, item.get("value")))
 
         self._heap = entries
         self._next_seq = next_seq
-        # Build a valid min-max heap from the loaded entries (O(n)).
         self._heapify()
 
     # ------------------------------------------------------------------
-    # Internal: invariant validation (for tests / debugging)
+    # Internal: invariant validation (used in test suite)
     # ------------------------------------------------------------------
 
     def _validate_invariants(self) -> None:
-        """Verify all internal invariants.
-
-        Checks
-        ------
-        1. Index-map size equals heap size.
-        2. Every index-map entry points to the correct heap position.
-        3. The min-max heap ordering property holds for every node
-           (checked against children *and* grandchildren).
-
-        Raises
-        ------
-        AssertionError
-            On any invariant violation, with a descriptive message.
-        """
+        """Verify internal consistency of index map and min-max heap property."""
         n = len(self._heap)
+        assert len(self._index) == n, f"Index size {len(self._index)} != heap size {n}"
 
-        # 1. Size consistency.
-        assert len(self._index) == n, (
-            f"Index-map size {len(self._index)} != heap size {n}"
-        )
-
-        # 2. Index-map consistency.
         for i, entry in enumerate(self._heap):
-            assert entry.item_id in self._index, (
-                f"item_id '{entry.item_id}' at heap[{i}] missing from "
-                f"index map"
-            )
-            assert self._index[entry.item_id] == i, (
-                f"Index map says '{entry.item_id}' is at "
-                f"{self._index[entry.item_id]}, but it is at {i}"
-            )
+            assert entry.item_id in self._index, f"Missing item '{entry.item_id}' in index"
+            assert self._index[entry.item_id] == i, f"Index mismatch for '{entry.item_id}'"
 
-        # 3. Min-max heap property.
         for i in range(n):
             key_i = self._heap[i]._key()
             is_min = self._is_min_level(i)
 
-            # Check children.
             for c in range(2 * i + 1, min(2 * i + 3, n)):
                 key_c = self._heap[c]._key()
                 if is_min:
-                    assert key_i <= key_c, (
-                        f"Min-level violation: heap[{i}]={key_i} > "
-                        f"child heap[{c}]={key_c}"
-                    )
+                    assert key_i <= key_c, f"Min-level child violation at {i} -> {c}"
                 else:
-                    assert key_i >= key_c, (
-                        f"Max-level violation: heap[{i}]={key_i} < "
-                        f"child heap[{c}]={key_c}"
-                    )
+                    assert key_i >= key_c, f"Max-level child violation at {i} -> {c}"
 
-            # Check grandchildren.
             for gc in range(4 * i + 3, min(4 * i + 7, n)):
                 key_gc = self._heap[gc]._key()
                 if is_min:
-                    assert key_i <= key_gc, (
-                        f"Min-level violation: heap[{i}]={key_i} > "
-                        f"grandchild heap[{gc}]={key_gc}"
-                    )
+                    assert key_i <= key_gc, f"Min-level grandchild violation at {i} -> {gc}"
                 else:
-                    assert key_i >= key_gc, (
-                        f"Max-level violation: heap[{i}]={key_i} < "
-                        f"grandchild heap[{gc}]={key_gc}"
-                    )
+                    assert key_i >= key_gc, f"Max-level grandchild violation at {i} -> {gc}"
